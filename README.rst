@@ -10,6 +10,9 @@ Django app for Firebase Cloud Messaging. Used as an unified platform for sending
 
 Supports Firebase Cloud Messaging HTTP v1 API. If you're looking for the legacy API, use ``fcm-django<1``!
 
+Async queryset send APIs require ``firebase-admin>=6.9`` because they use
+``firebase_admin.messaging.send_each_async`` directly.
+
 FCMDevice model fields
  - *registration_id* (required - is FCM token)
  - *name* (optional)
@@ -31,65 +34,16 @@ Demo javascript client project
 Unsure how to use this project? Check out the demo at:
 https://github.com/xtrinch/fcm-django-web-demo
 
-Migration to v1.0
------------------
-
-We've replaced Python package ``pyfcm`` for Firebase's own package ``firebase-admin``.
-Thus, we no longer use an API key. Instead, you'll need an environment variable
-``GOOGLE_APPLICATION_CREDENTIALS`` which is a path pointing to your JSON-file stored
-credentials. To learn more or view other options to input credentials, visit the
-`Google Cloud docs <https://cloud.google.com/docs/authentication/getting-started>`_.
-
-Finally, in your ``settings.py`` (or whatever imported file), add:
-
-.. code-block:: python
-
-    from firebase_admin import initialize_app
-    FIREBASE_APP = initialize_app()
-    # Or just
-    initialize_app()
-
-The API for sending messages is now under the ``firebase-admin`` package; hence,
-we removed the methods ``send_data_message`` from the QuerySet and class instance
-methods. Instead, everything is under a single method: ``send_message``
-
-.. code-block:: python
-
-    from firebase_admin.messaging import Message, Notification
-    FCMDevice.objects.send_message(Message(data=dict()))
-    # Note: You can also combine the data and notification kwarg
-    FCMDevice.objects.send_message(
-        Message(notification=Notification(title="title", body="body", image="image_url"))
-    )
-    device = FCMDevice.objects.first()
-    device.send_message(Message(...))
-
-Additionally, we've added Firebase's new Topic API, allowing for easier sending
-of bulk messages.
-
-.. code-block:: python
-
-    from firebase_admin.messaging import Message, Notification
-    topic = "A topic"
-    FCMDevice.objects.handle_subscription(True, topic)
-    message = Message(..., topic=topic)
-    FCMDevice.objects.filter(is_cool=True).send_message(message)
-
-There are two additional parameters to both methods:
-``skip_registration_id_lookup`` and ``additional_registration_ids``.
-Visit `Sending Messages <https://github.com/xtrinch/fcm-django#sending-messages>`_ to learn more.
-
-Note: ``registration_ids`` is actually incorrect terminology as it
-should actually be called ``registration tokens``. However, to be
-consistent with ``django-push-notifications``, we've refrained from
-switching to stay backwards compatible in the docs and with the
-sister package.
+Upgrading from pre-1.0
+----------------------
+If you're still migrating from the old ``pyfcm``-based releases, see
+`the v1.0 migration guide <docs/pages/migrating_to_v1.rst>`_.
 
 Setup
 -----
 You can install the library directly from pypi using pip:
 
-.. code-block::
+.. code-block:: console
 
     pip install fcm-django
 
@@ -117,6 +71,9 @@ Edit your settings.py file:
     # https://cloud.google.com/docs/authentication/getting-started>
 
     FCM_DJANGO_SETTINGS = {
+         # an instance of firebase_admin.App to be used as default for all fcm-django requests
+         # default: None (the default Firebase app)
+        "DEFAULT_FIREBASE_APP": None,
          # default: _('FCM Django')
         "APP_VERBOSE_NAME": "[string for AppConfig's verbose_name]",
          # true if you want to have only one active device per registered user at a time
@@ -126,10 +83,9 @@ Edit your settings.py file:
          # are deleted upon receiving error response from FCM
          # default: False
         "DELETE_INACTIVE_DEVICES": True/False,
-        # Transform create of an existing Device (based on registration id) into
-		    # an update. See the section
-        # "Update of device with duplicate registration ID" for more details.
-        "UPDATE_ON_DUPLICATE_REG_ID": True/False,
+         # emit the ``device_deactivated`` signal when this library deactivates devices
+         # default: False
+        "EMIT_DEVICE_DEACTIVATED_SIGNAL": True/False,
     }
 
 Native Django migrations are in use. ``manage.py migrate`` will install and migrate all models.
@@ -188,6 +144,7 @@ section for more information.
     device = FCMDevice.objects.all().first()
     # send_message parameters include: message, dry_run, app
     device.send_message(Message(data={...}))
+    device.send_message(Message(data={...}), dry_run=True)
 
 Sending messages in bulk
 ------------------------
@@ -200,8 +157,163 @@ Sending messages in bulk
     # You can still use .filter() or any methods that return QuerySet (from the chain)
     devices = FCMDevice.objects.all()
     devices.send_message(Message(data={...}))
-    # Or (send_message parameters include: messages, dry_run, app)
+    devices.send_message(Message(data={...}), dry_run=True)
+    # Or (send_message parameters include: message, dry_run, app)
     FCMDevice.objects.send_message(Message(...))
+
+Use ``dry_run=True`` to validate the payload with Firebase without actually
+delivering a notification. This is useful during development and integration
+testing when you want to verify message construction without sending a real
+push notification to devices.
+
+Sending messages raises all the errors that ``firebase-admin`` raises, so make sure
+they are caught and dealt with in your application code:
+
+- ``FirebaseError`` – If an error occurs while sending the message to the FCM service.
+- ``ValueError`` – If the input arguments are invalid.
+
+For more info, see https://firebase.google.com/docs/reference/admin/python/firebase_admin.messaging#firebase_admin.messaging.BatchResponse
+
+Inspecting batch send failures
+------------------------------
+
+``send_message()`` returns a ``FirebaseResponseDict`` wrapper around Firebase's
+``BatchResponse``. For batch sends, Firebase may return per-device failures in the
+response instead of raising an exception for the whole call.
+
+Useful fields on the returned object include:
+
+- ``response.success_count``
+- ``response.failure_count``
+- ``response.has_failures``
+- ``response.all_failed``
+- ``response.failed_registration_ids``
+- ``response.failed_exceptions``
+- ``response.summary``
+
+Example:
+
+.. code-block:: python
+
+    response = FCMDevice.objects.send_message(Message(...))
+
+    if response.has_failures:
+        print(response.failure_count)
+        print(response.failed_registration_ids)
+        print(response.failed_exceptions)
+
+This is especially useful for configuration-related failures such as APNS or
+credential issues, where devices may fail without being deactivated.
+
+Device deactivation signal
+--------------------------
+
+If you want an explicit hook when ``fcm-django`` deactivates devices, enable the
+setting below:
+
+.. code-block:: python
+
+    FCM_DJANGO_SETTINGS = {
+        "EMIT_DEVICE_DEACTIVATED_SIGNAL": True,
+    }
+
+Then subscribe to ``device_deactivated``:
+
+.. code-block:: python
+
+    from fcm_django.signals import device_deactivated
+
+    def on_device_deactivated(
+        sender,
+        registration_ids,
+        device_ids,
+        user_ids,
+        reason,
+        source,
+        metadata,
+        **kwargs,
+    ):
+        print(registration_ids)
+        print(device_ids)
+        print(user_ids)
+        print(reason)
+        print(source)
+        print(metadata)
+
+    device_deactivated.connect(on_device_deactivated)
+
+The signal is disabled by default and is emitted for library-managed device
+deactivations. Its payload includes:
+
+- ``registration_ids``: registration tokens that were deactivated
+- ``device_ids``: matching device primary keys
+- ``user_ids``: matching user primary keys, excluding devices without a user
+- ``reason``: the deactivation reason
+- ``source``: the library call site that triggered it
+- ``metadata``: extra context such as ``failed_exceptions``
+
+Current ``reason`` values include:
+
+- ``firebase_error``
+- ``one_device_per_user``
+- ``duplicate_registration_id``
+- ``manual_disable``
+
+Current ``source`` values include:
+
+- ``send_message``
+- ``perform_create``
+- ``perform_update``
+- ``serializer_create``
+- ``serializer_update``
+- ``admin_action``
+
+Sending personalized messages in bulk
+-------------------------------------
+
+Use ``send_bulk_personalized_messages`` when each device should receive a different
+title or body while still being sent in Firebase batches.
+
+.. code-block:: python
+
+    from fcm_django.models import FCMDevice
+
+    FCMDevice.objects.send_bulk_personalized_messages(
+        title_template="Hello {name}",
+        body_template="You have {count} new messages",
+        message_data={
+            "token-1": {"name": "Alice", "count": 3},
+            "token-2": {"name": "Bob", "count": 7},
+        },
+        data_fields={"kind": "digest"},
+    )
+
+``message_data`` is keyed by registration ID. Missing template variables are left
+unchanged in the rendered message.
+
+Async queryset batch sending
+----------------------------
+
+If you are calling fcm-django from an async Django view or other async context,
+use the queryset batch APIs with their async counterparts:
+
+.. code-block:: python
+
+    from firebase_admin.messaging import Message, Notification
+    from fcm_django.models import FCMDevice
+
+    await FCMDevice.objects.filter(user=request.user).asend_message(
+        Message(notification=Notification(title="Hi", body="Async batch send")),
+    )
+
+    await FCMDevice.objects.asend_bulk_personalized_messages(
+        title_template="Hello {name}",
+        body_template="You have {count} updates",
+        message_data={"token-1": {"name": "Alice", "count": 3}},
+    )
+
+These methods mirror ``send_message`` and ``send_bulk_personalized_messages`` on
+``FCMDeviceQuerySet`` and are intended for batch queryset operations.
 
 Subscribing or Unsubscribing Users to topic
 -------------------------------------------
@@ -211,20 +323,18 @@ Subscribing or Unsubscribing Users to topic
     from fcm_django.models import FCMDevice
 
     # Subscribing
-    FCMDevice.objects.all().handle_topic_subscription(True, topic="TOPIC NAME"))
+    FCMDevice.objects.all().handle_topic_subscription(True, topic="TOPIC NAME")
     device = FCMDevice.objects.all().first()
-    device.handle_topic_subscription(True, topic="TOPIC NAME"))
+    device.handle_topic_subscription(True, topic="TOPIC NAME")
 
     # Finally you can send a message to that topic
     from firebase_admin.messaging import Message
-    message = Message(..., topic="A topic")
-    # You can still use .filter() or any methods that return QuerySet (from the chain)
-    FCMDevice.objects.send_message(message)
+    FCMDevice.send_topic_message(Message(...), "TOPIC NAME")
 
     # Unsubscribing
-    FCMDevice.objects.all().handle_topic_subscription(False, topic="TOPIC NAME"))
+    FCMDevice.objects.all().handle_topic_subscription(False, topic="TOPIC NAME")
     device = FCMDevice.objects.all().first()
-    device.handle_topic_subscription(False, topic="TOPIC NAME"))
+    device.handle_topic_subscription(False, topic="TOPIC NAME")
 
 Sending messages to topic
 -------------------------
@@ -234,10 +344,7 @@ Sending messages to topic
     from firebase_admin.messaging import Message
     from fcm_django.models import FCMDevice
 
-    # You can still use .filter() or any methods that return QuerySet (from the chain)
-    FCMDevice.objects.all().send_message(Message(data={...}, topic="TOPIC NAME"))
-    device = FCMDevice.objects.all().first()
-    device.send_message(Message(data={...}, topic="TOPIC NAME"))
+    FCMDevice.send_topic_message(Message(data={...}), "TOPIC NAME")
 
 Additional Parameters
 ---------------------
@@ -258,16 +365,66 @@ lookup that goes along with your query.
 Using multiple FCM apps
 -----------------------
 
-By default the message will be sent using the default FCM ``firebase_admin.App`` (we initialized this in our settings). This default can be overridden by specifying an app when calling send_message. This can be used to send messages using different firebase projects.
+By default the message will be sent using the default FCM ``firebase_admin.App`` (we initialized this in our settings),
+or the one specified with the ``DEFAULT_FIREBASE_APP`` setting.
+
+This default can be overridden by specifying an app when calling send_message. This can be used to send messages using different firebase projects.
 
 .. code-block:: python
 
-    from firebase_app import App
-    from firebase_app.messaging import Notification
+    from firebase_admin import initialize_app
+    from firebase_admin.messaging import Message, Notification
     from fcm_django.models import FCMDevice
 
+    secondary_app = initialize_app(..., name="messaging")
     device = FCMDevice.objects.all().first()
-    device.send_message(notification=Notification(...), app=App(...))
+    device.send_message(
+        Message(notification=Notification(title="Hi", body="Secondary app")),
+        app=secondary_app,
+    )
+
+Setting a default Firebase app for FCM
+--------------------------------------
+
+If you want to use a specific Firebase app for all fcm-django requests, you can create an instance of
+``firebase_admin.App`` and pass it to fcm-django with the ``DEFAULT_FIREBASE_APP`` setting.
+
+The ``DEFAULT_FIREBASE_APP`` will be used for all send / subscribe / unsubscribe requests, include ``FCMDevice``'s
+admin actions.
+
+In your ``settings.py``:
+
+.. code-block:: python
+
+    from firebase_admin import initialize_app, credentials
+    from google.auth import load_credentials_from_file
+    from google.oauth2.service_account import Credentials
+
+    # create a custom Credentials class to load a non-default google service account JSON
+    class CustomFirebaseCredentials(credentials.ApplicationDefault):
+        def __init__(self, account_file_path: str):
+            super().__init__()
+            self._account_file_path = account_file_path
+
+        def _load_credential(self):
+            if not self._g_credential:
+                self._g_credential, self._project_id = load_credentials_from_file(self._account_file_path,
+                                                                                  scopes=credentials._scopes)
+
+    # init default firebase app
+    # this loads the default google service account with GOOGLE_APPLICATION_CREDENTIALS env variable
+    FIREBASE_APP = initialize_app()
+
+    # init second firebase app for fcm-django
+    # the environment variable contains a path to the custom google service account JSON
+    custom_credentials = CustomFirebaseCredentials(os.getenv('CUSTOM_GOOGLE_APPLICATION_CREDENTIALS'))
+    FIREBASE_MESSAGING_APP = initialize_app(custom_credentials, name='messaging')
+
+    FCM_DJANGO_SETTINGS = {
+        "DEFAULT_FIREBASE_APP": FIREBASE_MESSAGING_APP,
+        # [...] your other settings
+    }
+
 
 Django REST Framework (DRF) support
 -----------------------------------
@@ -276,7 +433,7 @@ Viewsets come in two different varieties:
 
 - ``FCMDeviceViewSet``
 
-    - Permissions as specified in settings (``AllowAny`` by default, which is not recommended)
+    - Permissions follow your Django REST Framework configuration
     - A device may be registered without associating it with a user
     - Will not allow duplicate registration_id's
 
@@ -284,7 +441,7 @@ Viewsets come in two different varieties:
 
     - Permissions are ``IsAuthenticated`` and custom permission ``IsOwner``, which will only allow the ``request.user`` to get and update devices that belong to that user
     - Requires a user to be authenticated, so all devices will be associated with a user
-    - Will allow duplicate registration_id's for different users, so you are responsible for cleanup (if that is generally perceived as undesired behaviour or if the package itself should be doing the cleanup, open an issue or email me)
+    - Will update the device on duplicate registration id
 
 Routes can be added one of two ways:
 
@@ -320,35 +477,41 @@ Routes can be added one of two ways:
     urlpatterns = [
         # Only allow creation of devices by authenticated users
         path('devices', FCMDeviceAuthorizedViewSet.as_view({'post': 'create'}), name='create_fcm_device'),
+        # Detail routes must include the lookup field used by the viewset
+        path(
+            'devices/<str:registration_id>',
+            FCMDeviceAuthorizedViewSet.as_view({'delete': 'destroy'}),
+            name='delete_fcm_device',
+        ),
         # ...
     ]
 
 Update of device with duplicate registration ID
 -----------------------------------------------
 
-The DRF viewset enforce the uniqueness of the registration ID. In same use case it
-may cause an issue: If an already registered mobile device changes its user, then
-it will fail to register because the registration ID already exist.
+Tokens are device specific, so if the user e.g. logs out of their account on your device, and another user
+logins on the same device, you do not wish the old user to receive messages while logged out.
 
-When option ``UPDATE_ON_DUPLICATE_REG_ID`` is set to True, then any creation of
-device with an already existing registration ID will be transformed into an update.
+Via DRF, any creation of device with an already existing registration ID will be transformed into an update.
+If done manually, you are responsible for deleting the old device entry.
 
-The ``UPDATE_ON_DUPLICATE_REG_ID`` only works with DRF.
+Using custom FCMDevice model
+----------------------------
+If you need to customize the device model, see
+`Using custom FCMDevice model <docs/pages/custom_fcmdevice_model.rst>`_.
 
 Python 3 support
 ----------------
-``fcm-django`` is fully compatible with Python 3.6+
+- ``fcm-django`` is fully compatible with Python 3.10+
+- Python 3.9 support was dropped because Python 3.9 reached end-of-life.
+- for Python 3.6, use ``fcm-django < 2.0.0`` , because `firebase-admin with version 6 drop support of Python 3.6 <https://firebase.google.com/support/release-notes/admin/python#version_600_-_06_october_2022>`_
+- for Python 3.7 + 3.8, use ``fcm-django <= 2.2.1`` 
 
 Django version compatibility
 ----------------------------
-Compatible with Django versions 2.2+. For lower django versions, use version ``fcm-django < 1``.
-
-Acknowledgements
-----------------
-Library relies on firebase-admin-sdk for sending notifications, for more info about all the possible fields, see:
-https://github.com/firebase/firebase-admin-python
-
-Migration from v0 to v1 was done by `Andrew-Chen-Wang <https://github.com/Andrew-Chen-Wang>`_
+Compatible with Django versions 4.2+.
+For Django version 2.2, use version ``fcm-django < 1.0.13``.
+For lower django versions, use version ``fcm-django < 1.0.0``.
 
 Need help, have any questions, suggestions?
 -------------------------------------------
@@ -357,5 +520,37 @@ Submit an issue/PR on this project. Please do not send me emails, as then the co
 Contributing
 ------------
 
-To setup the development environment, simply do ``pip install -r requirements.txt``
+To setup the development environment:
+  - create virtual environment with `python3 -m venv env`
+  - activate virtual environment with `source env/bin/activate` or `.\env\Scripts\activate.ps1` for Windows' Powershell  
+  - run ``pip install -r requirements_dev.txt``
+
 To manually run the pre-commit hook, run `pre-commit run --all-files`.
+
+Because there's possibility to use swapped models therefore tests contains two config files:
+
+1. with default settings and non swapped models ``settings/default.py``
+2. and with overwritten settings only that required by swapper - ``settings/swap.py``
+
+To run tests locally you could use ``pytest``, and if you need to check migrations on different DB then you have to specify environment variable ``DATABASE_URL`` ie 
+
+.. code-block:: console
+
+    export DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres
+    export DJANGO_SETTINGS_MODULE=tests.settings.default 
+    # or export DJANGO_SETTINGS_MODULE=tests.settings.swap
+    pytest
+
+Packaging for PyPi
+
+- run `source env/bin/activate`
+- run `rm -rf dist/`
+- run `python3 -m build`
+- run `twine upload dist/*`
+
+Acknowledgements
+----------------
+Library relies on firebase-admin-sdk for sending notifications, for more info about all the possible fields, see:
+https://github.com/firebase/firebase-admin-python
+
+Migration from v0 to v1 was done by `Andrew-Chen-Wang <https://github.com/Andrew-Chen-Wang>`_

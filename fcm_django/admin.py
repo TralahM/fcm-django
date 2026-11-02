@@ -1,9 +1,16 @@
-from typing import List, Tuple, Union
+# Django/DRF mixins and swapper-loaded models are not typed precisely enough
+# for pyright; relax the noisiest rules for this integration module.
+# pyright: reportAttributeAccessIssue=false, reportInvalidTypeForm=false
+# pyright: reportOptionalMemberAccess=false, reportArgumentType=false
 
+from typing import Union
+
+import swapper
 from django.apps import apps
 from django.contrib import admin, messages
 from django.utils.translation import gettext_lazy as _
 from django.utils.translation import ngettext_lazy
+from firebase_admin.exceptions import FirebaseError
 from firebase_admin.messaging import (
     ErrorInfo,
     Message,
@@ -12,10 +19,13 @@ from firebase_admin.messaging import (
     TopicManagementResponse,
 )
 
-from fcm_django.models import FCMDevice, FirebaseResponseDict, fcm_error_list
+from fcm_django.models import fcm_error_list
 from fcm_django.settings import FCM_DJANGO_SETTINGS as SETTINGS
+from fcm_django.types import FirebaseResponseDict
 
 User = apps.get_model(*SETTINGS["USER_MODEL"].split("."))
+
+FCMDevice = swapper.load_model("fcm_django", "fcmdevice")
 
 
 class DeviceAdmin(admin.ModelAdmin):
@@ -28,7 +38,10 @@ class DeviceAdmin(admin.ModelAdmin):
         "active",
         "date_created",
     )
-    list_filter = ("active",)
+    list_filter = (
+        "active",
+        "type",
+    )
     actions = (
         "send_message",
         "send_bulk_message",
@@ -36,6 +49,7 @@ class DeviceAdmin(admin.ModelAdmin):
         "bulk_subscribe_to_topic",
         "unsubscribe_to_topic",
         "bulk_unsubscribe_to_topic",
+        "send_topic_message",
         "enable",
         "disable",
     )
@@ -53,8 +67,8 @@ class DeviceAdmin(admin.ModelAdmin):
         request,
         response: Union[
             FirebaseResponseDict,
-            List[FirebaseResponseDict],
-            List[Tuple[SendResponse, str]],
+            list[FirebaseResponseDict],
+            list[tuple[SendResponse, str]],
         ],
         total_failure: int,
         is_topic: bool,
@@ -126,33 +140,38 @@ class DeviceAdmin(admin.ModelAdmin):
         send_bulk_message methods.
         """
         total_failure = 0
-        single_responses: List[Tuple[SendResponse, str]] = []
+        single_responses: list[tuple[SendResponse, str]] = []
 
-        for device in queryset:
-            device: "FCMDevice"
-            if bulk:
-                response = queryset.send_message(
-                    Message(
-                        notification=Notification(
-                            title="Test notification", body="Test bulk notification"
+        try:
+            for device in queryset:
+                device: "FCMDevice"
+                if bulk:
+                    response = queryset.send_message(
+                        Message(
+                            notification=Notification(
+                                title="Test notification", body="Test bulk notification"
+                            )
                         )
                     )
-                )
-                total_failure = len(response.deactivated_registration_ids)
-                return self._send_deactivated_message(
-                    request, response, total_failure, False
-                )
-            else:
-                response = device.send_message(
-                    Message(
-                        notification=Notification(
-                            title="Test notification", body="Test single notification"
+                    total_failure = len(response.deactivated_registration_ids)
+                    return self._send_deactivated_message(
+                        request, response, total_failure, False
+                    )
+                else:
+                    response = device.send_message(
+                        Message(
+                            notification=Notification(
+                                title="Test notification",
+                                body="Test single notification",
+                            )
                         )
                     )
-                )
-                single_responses.append((response, device.registration_id))
-                if type(response) != SendResponse:
-                    total_failure += 1
+                    single_responses.append((response, device.registration_id))
+                    if type(response) != SendResponse:
+                        total_failure += 1
+        except FirebaseError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+            return
 
         self._send_deactivated_message(request, single_responses, total_failure, False)
 
@@ -195,7 +214,14 @@ class DeviceAdmin(admin.ModelAdmin):
                     "test-topic",
                 )
                 single_responses.append(
-                    (response.response.errors[0], device.registration_id)
+                    (
+                        (
+                            response.response.errors[0]
+                            if len(response.response.errors) > 0
+                            else "Success"
+                        ),
+                        device.registration_id,
+                    )
                 )
                 total_failure += len(response.deactivated_registration_ids)
 
@@ -221,13 +247,35 @@ class DeviceAdmin(admin.ModelAdmin):
 
     bulk_unsubscribe_to_topic.short_description = _("Unsubscribe to test topic in bulk")
 
+    def handle_send_topic_message(self, request, queryset):
+        try:
+            FCMDevice.send_topic_message(
+                Message(
+                    notification=Notification(
+                        title="Test notification", body="Test single notification"
+                    )
+                ),
+                "test-topic",
+            )
+        except FirebaseError as exc:
+            self.message_user(request, str(exc), level=messages.ERROR)
+
+    def send_topic_message(self, request, queryset):
+        self.handle_send_topic_message(request, queryset)
+
+    send_topic_message.short_description = _("Send message test topic")
+
     def enable(self, request, queryset):
         queryset.update(active=True)
 
     enable.short_description = _("Enable selected devices")
 
     def disable(self, request, queryset):
-        queryset.update(active=False)
+        queryset.deactivate(
+            reason="manual_disable",
+            source="admin_action",
+            metadata={},
+        )
 
     disable.short_description = _("Disable selected devices")
 

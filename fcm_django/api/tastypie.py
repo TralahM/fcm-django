@@ -1,8 +1,12 @@
+# swapper.load_model is typed as Optional, but the model is always installed here.
+# pyright: reportOptionalMemberAccess=false
+
+import swapper
 from tastypie.authentication import BasicAuthentication
 from tastypie.authorization import Authorization
 from tastypie.resources import ModelResource
 
-from fcm_django.models import FCMDevice
+FCMDevice = swapper.load_model("fcm_django", "fcmdevice")
 
 
 class FCMDeviceResource(ModelResource):

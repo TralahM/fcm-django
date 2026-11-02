@@ -1,3 +1,9 @@
+# Django/DRF mixins and swapper-loaded models are not typed precisely enough
+# for pyright; relax the noisiest rules for this integration module.
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
+
+import swapper
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 from rest_framework import permissions, status
 from rest_framework.mixins import CreateModelMixin
@@ -5,8 +11,9 @@ from rest_framework.response import Response
 from rest_framework.serializers import ModelSerializer, Serializer, ValidationError
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from fcm_django.models import FCMDevice
 from fcm_django.settings import FCM_DJANGO_SETTINGS as SETTINGS
+
+FCMDevice = swapper.load_model("fcm_django", "fcmdevice")
 
 
 # Serializers
@@ -58,7 +65,14 @@ class UniqueRegistrationSerializerMixin(Serializer):
                         registration_id=registration_id
                     ).exclude(id=primary_key)
                     if attrs.get("active", False):
-                        devices.filter(~Q(user=user)).update(active=False)
+                        devices.filter(~Q(user=user)).deactivate(
+                            reason="duplicate_registration_id",
+                            source="serializer_update",
+                            metadata={
+                                "request_method": request_method,
+                                "target_user_id": user.id,
+                            },
+                        )
                     devices = devices.filter(user=user)
                 else:
                     devices = Device.objects.filter(
@@ -67,7 +81,14 @@ class UniqueRegistrationSerializerMixin(Serializer):
         elif request_method == "create":
             if user is not None and user.is_authenticated:
                 devices = Device.objects.filter(registration_id=registration_id)
-                devices.filter(~Q(user=user)).update(active=False)
+                devices.filter(~Q(user=user)).deactivate(
+                    reason="duplicate_registration_id",
+                    source="serializer_create",
+                    metadata={
+                        "request_method": request_method,
+                        "target_user_id": user.id,
+                    },
+                )
                 devices = devices.filter(user=user, active=True)
             else:
                 devices = Device.objects.filter(registration_id=registration_id)
@@ -117,18 +138,45 @@ class DeviceViewSetMixin:
             self.perform_update(serializer)
             return Response(serializer.data)
         else:
-            self.perform_create(serializer)
+            try:
+                # Savepoint so a concurrent insert of the same registration_id
+                # (check-then-insert race) doesn't break the outer transaction.
+                with transaction.atomic():
+                    self.perform_create(serializer)
+            except IntegrityError as exc:
+                return self._handle_create_conflict(request, exc)
             headers = self.get_success_headers(serializer.data)
             return Response(
                 serializer.data, status=status.HTTP_201_CREATED, headers=headers
             )
+
+    def _handle_create_conflict(self, request, exc):
+        registration_id = request.data.get("registration_id")
+        instance = (
+            self.queryset.model.objects.filter(registration_id=registration_id).first()
+            if registration_id
+            else None
+        )
+        if instance is None:
+            raise exc
+        if not SETTINGS.get("UPDATE_ON_DUPLICATE_REG_ID"):
+            raise ValidationError({"registration_id": "This field must be unique."})
+
+        serializer = self.get_serializer(instance, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_update(serializer)
+        return Response(serializer.data)
 
     def perform_create(self, serializer):
         if self.request.user.is_authenticated:
             if SETTINGS["ONE_DEVICE_PER_USER"] and self.request.data.get(
                 "active", True
             ):
-                FCMDevice.objects.filter(user=self.request.user).update(active=False)
+                FCMDevice.objects.filter(user=self.request.user).deactivate(
+                    reason="one_device_per_user",
+                    source="perform_create",
+                    metadata={"user_id": self.request.user.id},
+                )
             return serializer.save(user=self.request.user)
         return serializer.save()
 
@@ -137,7 +185,11 @@ class DeviceViewSetMixin:
             if SETTINGS["ONE_DEVICE_PER_USER"] and self.request.data.get(
                 "active", False
             ):
-                FCMDevice.objects.filter(user=self.request.user).update(active=False)
+                FCMDevice.objects.filter(user=self.request.user).deactivate(
+                    reason="one_device_per_user",
+                    source="perform_update",
+                    metadata={"user_id": self.request.user.id},
+                )
 
             return serializer.save(user=self.request.user)
         return serializer.save()
@@ -153,7 +205,7 @@ class AuthorizedMixin:
 
 # ViewSets
 class FCMDeviceViewSet(DeviceViewSetMixin, ModelViewSet):
-    queryset = FCMDevice.objects.all()
+    queryset = FCMDevice.objects.order_by("-id")
     serializer_class = FCMDeviceSerializer
 
 
